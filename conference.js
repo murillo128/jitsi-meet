@@ -1112,11 +1112,76 @@ export default {
     videoSwitchInProgress: false,
 
     /**
+     * This fields stores a handler which will create a Promise which turns off
+     * the screen sharing and restores the previous video state (was there
+     * any video, before switching to screen sharing ? was it muted ?).
+     *
+     * Once called this fields is cleared to <tt>null</tt>.
+     * {@type Promise|null}
+     */
+    _untoggleScreenSharing: null,
+
+    /**
+     * Creates a Promise which turns off the screen sharing and restores
+     * the previous state described by the arguments.
+     *
+     * This method is bound to the appropriate values, after switching to screen
+     * sharing and stored in {@link _untoggleScreenSharing}.
+     *
+     * @param {boolean} didHaveVideo indicates if there was a camera video being
+     * used, before switching to screen sharing.
+     * @param {boolean} wasVideoMuted indicates if the video was muted, before
+     * switching to screen sharing.
+     * @return {Promise} resolved after the screen sharing is turned off, or
+     * rejected with some error (no idea what kind of error, possible GUM error)
+     * in case it fails.
+     * @private
+     */
+    _turnScreenSharingOff(didHaveVideo, wasVideoMuted) {
+        this._untoggleScreenSharing = null;
+        this.videoSwitchInProgress = true;
+        return new Promise((resolve, reject) => {
+            APP.remoteControl.receiver.stop();
+            if (didHaveVideo) {
+                createLocalTracks({ devices: ['video'] })
+                    .then(([stream]) => this.useVideoStream(stream))
+                    .then(() => {
+                        JitsiMeetJS.analytics.sendEvent(
+                            'conference.sharingDesktop.stop');
+                        logger.log('switched back to local video');
+                        if (!localVideo && wasVideoMuted) {
+                            reject('No local video to be muted!');
+                        } else if (wasVideoMuted && localVideo) {
+                            localVideo.mute().then(resolve, reject);
+                        } else {
+                            resolve();
+                        }
+                    })
+                    .catch((err) => {
+                        // NOTE this call is asynchronous, but not part of
+                        // the Promise chain ??? (I preserved the old code here)
+                        this.useVideoStream(null);
+                        logger.error(
+                            'failed to switch back to local video', err);
+                        reject(err);
+                    });
+            } else {
+                this.useVideoStream(null).then(resolve, reject);
+            }
+        })
+        .then(() => {
+            this.videoSwitchInProgress = false;
+        }, (error) => {
+            this.videoSwitchInProgress = false;
+            throw error;
+        });
+    },
+
+    /**
      * Toggles between screensharing and camera video.
-     * @param {boolean} [shareScreen]
      * @return {Promise.<T>}
      */
-    toggleScreenSharing(shareScreen = !this.isSharingScreen) {
+    toggleScreenSharing() {
         if (this.videoSwitchInProgress) {
             return Promise.reject('Switch in progress.');
         }
@@ -1131,11 +1196,11 @@ export default {
             return Promise.reject('No screensharing in audio only mode');
         }
 
-        this.videoSwitchInProgress = true;
-        let externalInstallation = false;
-
-        if (shareScreen) {
-            const didHaveVideo = Boolean(this.localVideo);
+        if (!this._untoggleScreenSharing) {
+            this.videoSwitchInProgress = true;
+            let externalInstallation = false;
+            const didHaveVideo = Boolean(localVideo);
+            const wasVideoMuted = this.videoMuted;
 
             return createLocalTracks({
                 devices: ['desktop'],
@@ -1162,22 +1227,26 @@ export default {
                     }
                 }
             }).then(([stream]) => {
+                // Stores the "untoggle" handler which remembers whether was
+                // there any video before and whether was it muted.
+                this._untoggleScreenSharing
+                    = this._turnScreenSharingOff
+                          .bind(this, didHaveVideo, wasVideoMuted);
                 DSExternalInstallationInProgress = false;
                 // close external installation dialog on success.
                 if(externalInstallation)
                     $.prompt.close();
-                if (didHaveVideo) {
-                    stream.on(
-                        TrackEvents.LOCAL_TRACK_STOPPED,
-                        () => {
-                            // If the stream was stopped during screen sharing
-                            // session then we should switch back to video.
-                            if (this.isSharingScreen) {
-                                this.toggleScreenSharing(false);
-                            }
+                stream.on(
+                    TrackEvents.LOCAL_TRACK_STOPPED,
+                    () => {
+                        // If the stream was stopped during screen sharing
+                        // session then we should switch back to video.
+                        if (this.isSharingScreen){
+                            this._untoggleScreenSharing
+                                && this._untoggleScreenSharing();
                         }
-                    );
-                }
+                    }
+                );
                 return this.useVideoStream(stream);
             }).then(() => {
                 this.videoSwitchInProgress = false;
@@ -1189,7 +1258,17 @@ export default {
                 if(externalInstallation)
                     $.prompt.close();
                 this.videoSwitchInProgress = false;
-                this.toggleScreenSharing(false);
+                // Pawel: With this call I'm trying to preserve the original
+                // behaviour although it is not clear why would we "untoggle"
+                // on failure. I suppose it was to restore video in case there
+                // was some problem during "this.useVideoStream(desktopStream)".
+                // It's important to note that the handler will not be available
+                // if we fail early on trying to get desktop media (which makes
+                // sense, because the camera video is still being used, so
+                // nothing to "untoggle").
+                if (this._untoggleScreenSharing) {
+                    this._untoggleScreenSharing();
+                }
 
                 if (err.name === TrackErrors.CHROME_EXTENSION_USER_CANCELED) {
                     return;
@@ -1226,21 +1305,7 @@ export default {
                     dialogTitleKey, dialogTxt, false);
             });
         } else {
-            APP.remoteControl.receiver.stop();
-            return createLocalTracks(
-                { devices: ['video'] })
-            .then(
-                ([stream]) => this.useVideoStream(stream)
-            ).then(() => {
-                this.videoSwitchInProgress = false;
-                JitsiMeetJS.analytics.sendEvent(
-                    'conference.sharingDesktop.stop');
-                logger.log('sharing local video');
-            }).catch((err) => {
-                this.useVideoStream(null);
-                this.videoSwitchInProgress = false;
-                logger.error('failed to share local video', err);
-            });
+            return this._untoggleScreenSharing();
         }
     },
     /**
