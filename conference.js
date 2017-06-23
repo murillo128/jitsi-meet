@@ -2011,9 +2011,10 @@ export default {
 
                     // If video was muted before, or we unplugged current device
                     // and selected new one, then mute new video track.
-                    if (videoWasMuted ||
-                        currentDevices.videoinput.length >
-                        availableVideoInputDevices.length) {
+                    if (!this.isSharingScreen &&
+                        (videoWasMuted ||
+                            currentDevices.videoinput.length >
+                                availableVideoInputDevices.length)) {
                         muteLocalVideo(true);
                     }
                 }));
